@@ -119,10 +119,31 @@ function Base.show(io::IO, ::MIME"text/plain", mha::MultiHeadAttention)
     return nothing
 end
 
+"""
+    parse_mha_dims(dims::IntegerType) -> NamedTuple
+
+Parse a single uniform dimension specification for standard Multi-Head Attention (MHA).
+
+Sets all feature dimensions—input (`q_in`, `k_in`, `v_in`), intermediate projections 
+(`qk`, `v`), and final output (`out`)—to `dims`.
+"""
 function parse_mha_dims(dims::IntegerType)
     return (; q_in=dims, k_in=dims, v_in=dims, qk=dims, v=dims, out=dims)
 end
 
+"""
+    parse_mha_dims((in_dims, (qkv_dims, out_dims))) -> NamedTuple
+
+Parse flexible or heterogeneous dimension specifications for Multi-Head Attention.
+
+# Inputs
+- `in_dims`: Integer (shared for Q/K/V) or `NTuple{3, Integer}` `(q_in, k_in, v_in)` for cross-attention.
+- `qkv_dims`: Integer (shared projection size for QK and V) or `NTuple{2, Integer}` `(qk, v)`.
+- `out_dims`: Integer dimension for the final output linear projection.
+
+# Returns
+A `NamedTuple` with keys `(; q_in, k_in, v_in, qk, v, out)`.
+"""
 function parse_mha_dims((in_dims, (qkv_dims, out_dims)))
     if in_dims isa IntegerType
         q_in, k_in, v_in = in_dims, in_dims, in_dims
@@ -284,14 +305,22 @@ end
 function apply_groupqueryattention(gqa::GroupQueryAttention, ps, st, q, k, v, mask=nothing)
     q, k, v = match_eltype(gqa, ps, st, q, k, v)
 
+    # Linear projection into attention feature space
+    # Output shapes:
+    #   q: (head_dim_qk * nqheads, seq_len, batch)
+    #   k: (head_dim_qk * nkvheads, seq_len, batch)
+    #   v: (head_dim_v  * nkvheads, seq_len, batch)
     q, q_st = gqa.q_proj(q, ps.q_proj, st.q_proj)
     k, k_st = gqa.k_proj(k, ps.k_proj, st.k_proj)
     v, v_st = gqa.v_proj(v, ps.v_proj, st.v_proj)
 
+    # Wrap dropout in stateful layer to avoid manual threading of parameters
     dropout = StatefulLuxLayer(
         gqa.attention_dropout, ps.attention_dropout, st.attention_dropout
     )
 
+    # Scaled Dot Product Attention Kernel
+    # Yields context x: (head_dim, nqheads, q_len, batch) and attention weights α
     x, α = scaled_dot_product_attention(
         reshape(q, size(q, 1) ÷ gqa.nqheads,  gqa.nqheads,  size(q)[2:end]...),
         reshape(k, size(k, 1) ÷ gqa.nkvheads, gqa.nkvheads, size(k)[2:end]...), # Uses nkvheads
